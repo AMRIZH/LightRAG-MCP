@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment and secrets (local only)
+.env
+.env.*
+env
+!.env.example
+!.env.local.example
+
+# Runtime artifacts
+logs/
+lightrag.log
+*.log
+data/rag_storage/
+data/tiktoken/
+data/inputs_prepared/
+data/inputs/
+data/metadata/*
+!data/metadata/example.json
+
+# Local editor/system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+dev/
