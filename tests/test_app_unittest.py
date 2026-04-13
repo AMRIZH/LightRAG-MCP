@@ -53,22 +53,6 @@ class TestTokenAndFallbackLogic(unittest.TestCase):
         self.assertEqual(retries, 0)
         self.assertIn(">= 0", err or "")
 
-    def test_parse_embedding_proxy_key_weights_prefers_primary_weight(self) -> None:
-        weights, err = run_server.parse_embedding_proxy_key_weights(
-            {"EMBEDDING_PROXY_PRIMARY_WEIGHT": "6"},
-            key_count=4,
-        )
-        self.assertIsNone(err)
-        self.assertEqual(weights, [6, 1, 1, 1])
-
-    def test_parse_embedding_proxy_key_weights_accepts_explicit_weights(self) -> None:
-        weights, err = run_server.parse_embedding_proxy_key_weights(
-            {"EMBEDDING_PROXY_KEY_WEIGHTS": "5,2,1"},
-            key_count=3,
-        )
-        self.assertIsNone(err)
-        self.assertEqual(weights, [5, 2, 1])
-
     @patch("scripts.check_api_keys.test_embedding_with_key")
     def test_embedding_uses_second_key_when_first_fails(self, mock_test_embedding_with_key) -> None:
         mock_test_embedding_with_key.side_effect = [
@@ -119,7 +103,6 @@ class TestTokenAndFallbackLogic(unittest.TestCase):
             "EMBEDDING_BINDING_API_KEY_1": "key-1",
             "EMBEDDING_BINDING_API_KEY_2": "key-2",
             "EMBEDDING_PROXY_PORT": "8877",
-            "EMBEDDING_PROXY_PRIMARY_WEIGHT": "3",
             "EMBEDDING_PROXY_429_WAIT_SECONDS": "15",
             "EMBEDDING_PROXY_MAX_429_RETRIES": "4",
         }
@@ -142,7 +125,6 @@ class TestTokenAndFallbackLogic(unittest.TestCase):
             start_proxy.assert_called_with(
                 upstream_host="https://api.voyageai.com/v1",
                 api_keys=["key-1", "key-2"],
-                key_weights=[3, 1],
                 port=8877,
                 retry_wait_seconds=15,
                 max_retries_on_429=4,

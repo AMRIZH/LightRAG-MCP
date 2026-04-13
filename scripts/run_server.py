@@ -98,15 +98,10 @@ def test_embedding_key(host: str, model: str, key: str, timeout: int = 20) -> bo
 def start_embedding_round_robin_proxy(
     upstream_host: str,
     api_keys: list[str],
-    key_weights: list[int],
     port: int,
     retry_wait_seconds: int,
     max_retries_on_429: int,
 ) -> ThreadingHTTPServer:
-    weighted_key_indexes: list[int] = []
-    for idx, weight in enumerate(key_weights):
-        weighted_key_indexes.extend([idx] * weight)
-
     request_counter = count(0)
     request_lock = threading.Lock()
 
@@ -146,8 +141,7 @@ def start_embedding_round_robin_proxy(
             body = self.rfile.read(content_length) if content_length > 0 else b""
 
             with request_lock:
-                weighted_idx = next(request_counter) % len(weighted_key_indexes)
-                start_idx = weighted_key_indexes[weighted_idx]
+                start_idx = next(request_counter) % len(api_keys)
 
             forward_path = request_path
             if forward_path.startswith("/v1/"):
@@ -295,53 +289,6 @@ def parse_embedding_proxy_max_429_retries(cfg: Dict[str, str]) -> tuple[int, str
     return retries, None
 
 
-def parse_embedding_proxy_key_weights(
-    cfg: Dict[str, str],
-    key_count: int,
-) -> tuple[list[int], str | None]:
-    if key_count < 1:
-        return [], "No embedding keys available for weighted routing"
-
-    raw_weights = cfg.get("EMBEDDING_PROXY_KEY_WEIGHTS", "").strip()
-    if raw_weights:
-        parts = [p.strip() for p in raw_weights.split(",") if p.strip()]
-        if len(parts) != key_count:
-            return (
-                [],
-                f"EMBEDDING_PROXY_KEY_WEIGHTS must contain exactly {key_count} positive integers",
-            )
-
-        weights: list[int] = []
-        for idx, part in enumerate(parts, start=1):
-            try:
-                value = int(part)
-            except ValueError:
-                return (
-                    [],
-                    f"EMBEDDING_PROXY_KEY_WEIGHTS contains non-integer value at position {idx}",
-                )
-
-            if value < 1:
-                return (
-                    [],
-                    f"EMBEDDING_PROXY_KEY_WEIGHTS values must be >= 1 (position {idx})",
-                )
-            weights.append(value)
-
-        return weights, None
-
-    raw_primary_weight = cfg.get("EMBEDDING_PROXY_PRIMARY_WEIGHT", "1").strip()
-    try:
-        primary_weight = int(raw_primary_weight)
-    except ValueError:
-        return [], "EMBEDDING_PROXY_PRIMARY_WEIGHT must be an integer >= 1"
-
-    if primary_weight < 1:
-        return [], "EMBEDDING_PROXY_PRIMARY_WEIGHT must be >= 1"
-
-    return [primary_weight] + [1] * (key_count - 1), None
-
-
 def get_server_executable(root: Path) -> Path:
     if os.name == "nt":
         return root / ".venv" / "Scripts" / "lightrag-server.exe"
@@ -443,19 +390,10 @@ def main() -> int:
             print(proxy_max_429_retries_error)
             return 1
 
-        key_weights, key_weights_error = parse_embedding_proxy_key_weights(
-            merged,
-            len(validated_keys),
-        )
-        if key_weights_error:
-            print(key_weights_error)
-            return 1
-
         try:
             proxy_server = start_embedding_round_robin_proxy(
                 upstream_host=emb_host,
                 api_keys=validated_keys,
-                key_weights=key_weights,
                 port=proxy_port,
                 retry_wait_seconds=proxy_wait_seconds,
                 max_retries_on_429=proxy_max_429_retries,
@@ -468,7 +406,7 @@ def main() -> int:
         os.environ["EMBEDDING_BINDING_API_KEY"] = "ROUND_ROBIN_PROXY"
         print(
             f"Embedding round-robin enabled across {len(validated_keys)} keys via local proxy on 127.0.0.1:{proxy_port} "
-            f"(weights: {key_weights}, 429 backoff: {proxy_wait_seconds}s, retries: {proxy_max_429_retries})"
+            f"(equal share, 429 backoff: {proxy_wait_seconds}s, retries: {proxy_max_429_retries})"
         )
     else:
         selected_embedding_key = validated_keys[0]
