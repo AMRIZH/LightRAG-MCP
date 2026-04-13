@@ -32,6 +32,7 @@ def collect_embedding_keys(cfg: Dict[str, str]) -> list[str]:
         "EMBEDDING_BINDING_API_KEY_1",
         "EMBEDDING_BINDING_API_KEY_2",
         "EMBEDDING_BINDING_API_KEY_3",
+        "EMBEDDING_BINDING_API_KEY_4",
         "EMBEDDING_BINDING_API_KEY_MAIN",
         "EMBEDDING_BINDING_API_KEY_FALLBACK",
         "EMBEDDING_BINDING_API_KEY",
@@ -137,7 +138,7 @@ def test_embedding(cfg: Dict[str, str], timeout: int) -> Tuple[bool, str]:
     if not keys:
         return (
             False,
-            "Missing embedding key(s). Set one of: EMBEDDING_BINDING_API_KEY_1..3, "
+            "Missing embedding key(s). Set one of: EMBEDDING_BINDING_API_KEY_1..4, "
             "EMBEDDING_BINDING_API_KEYS, EMBEDDING_BINDING_API_KEY_MAIN, "
             "EMBEDDING_BINDING_API_KEY_FALLBACK, or EMBEDDING_BINDING_API_KEY.",
         )

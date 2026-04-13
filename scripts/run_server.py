@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import count
@@ -58,6 +59,7 @@ def collect_embedding_keys(cfg: Dict[str, str]) -> list[str]:
         "EMBEDDING_BINDING_API_KEY_1",
         "EMBEDDING_BINDING_API_KEY_2",
         "EMBEDDING_BINDING_API_KEY_3",
+        "EMBEDDING_BINDING_API_KEY_4",
         "EMBEDDING_BINDING_API_KEY_MAIN",
         "EMBEDDING_BINDING_API_KEY_FALLBACK",
         "EMBEDDING_BINDING_API_KEY",
@@ -96,8 +98,15 @@ def test_embedding_key(host: str, model: str, key: str, timeout: int = 20) -> bo
 def start_embedding_round_robin_proxy(
     upstream_host: str,
     api_keys: list[str],
+    key_weights: list[int],
     port: int,
+    retry_wait_seconds: int,
+    max_retries_on_429: int,
 ) -> ThreadingHTTPServer:
+    weighted_key_indexes: list[int] = []
+    for idx, weight in enumerate(key_weights):
+        weighted_key_indexes.extend([idx] * weight)
+
     request_counter = count(0)
     request_lock = threading.Lock()
 
@@ -117,8 +126,8 @@ def start_embedding_round_robin_proxy(
             body = self.rfile.read(content_length) if content_length > 0 else b""
 
             with request_lock:
-                idx = next(request_counter) % len(api_keys)
-                key = api_keys[idx]
+                weighted_idx = next(request_counter) % len(weighted_key_indexes)
+                start_idx = weighted_key_indexes[weighted_idx]
 
             forward_path = request_path
             if forward_path.startswith("/v1/"):
@@ -126,25 +135,52 @@ def start_embedding_round_robin_proxy(
 
             upstream_url = upstream_host.rstrip("/") + forward_path
 
-            headers = {
-                "Authorization": f"Bearer {key}",
-                "Content-Type": self.headers.get("Content-Type", "application/json"),
-            }
+            total_attempts = max(1, max_retries_on_429 + 1)
+            upstream_resp = None
 
-            try:
-                upstream_resp = requests.post(
-                    upstream_url,
-                    headers=headers,
-                    data=body,
-                    timeout=120,
+            for attempt in range(total_attempts):
+                key = api_keys[(start_idx + attempt) % len(api_keys)]
+                headers = {
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": self.headers.get("Content-Type", "application/json"),
+                }
+
+                try:
+                    upstream_resp = requests.post(
+                        upstream_url,
+                        headers=headers,
+                        data=body,
+                        timeout=120,
+                    )
+                except requests.RequestException as exc:
+                    payload = json.dumps(
+                        {
+                            "error": "proxy_request_failed",
+                            "message": str(exc),
+                        }
+                    ).encode("utf-8")
+                    self.send_response(502)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+
+                if upstream_resp.status_code != 429 or attempt == total_attempts - 1:
+                    break
+
+                wait_seconds = retry_wait_seconds
+                retry_after_raw = upstream_resp.headers.get("Retry-After", "").strip()
+                if retry_after_raw.isdigit():
+                    wait_seconds = max(wait_seconds, int(retry_after_raw))
+
+                print(
+                    f"Embedding proxy got HTTP 429 (attempt {attempt + 1}/{total_attempts}); waiting {wait_seconds}s before retry"
                 )
-            except requests.RequestException as exc:
-                payload = json.dumps(
-                    {
-                        "error": "proxy_request_failed",
-                        "message": str(exc),
-                    }
-                ).encode("utf-8")
+                time.sleep(wait_seconds)
+
+            if upstream_resp is None:
+                payload = b'{"error":"proxy_request_failed","message":"no upstream response"}'
                 self.send_response(502)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
@@ -216,6 +252,79 @@ def parse_embedding_proxy_port(cfg: Dict[str, str]) -> tuple[int, str | None]:
     return port, None
 
 
+def parse_embedding_proxy_wait_seconds(cfg: Dict[str, str]) -> tuple[int, str | None]:
+    raw = cfg.get("EMBEDDING_PROXY_429_WAIT_SECONDS", "30").strip()
+    try:
+        wait_seconds = int(raw)
+    except ValueError:
+        return 0, "EMBEDDING_PROXY_429_WAIT_SECONDS must be an integer >= 1"
+
+    if wait_seconds < 1:
+        return 0, "EMBEDDING_PROXY_429_WAIT_SECONDS must be >= 1"
+
+    return wait_seconds, None
+
+
+def parse_embedding_proxy_max_429_retries(cfg: Dict[str, str]) -> tuple[int, str | None]:
+    raw = cfg.get("EMBEDDING_PROXY_MAX_429_RETRIES", "3").strip()
+    try:
+        retries = int(raw)
+    except ValueError:
+        return 0, "EMBEDDING_PROXY_MAX_429_RETRIES must be an integer >= 0"
+
+    if retries < 0:
+        return 0, "EMBEDDING_PROXY_MAX_429_RETRIES must be >= 0"
+
+    return retries, None
+
+
+def parse_embedding_proxy_key_weights(
+    cfg: Dict[str, str],
+    key_count: int,
+) -> tuple[list[int], str | None]:
+    if key_count < 1:
+        return [], "No embedding keys available for weighted routing"
+
+    raw_weights = cfg.get("EMBEDDING_PROXY_KEY_WEIGHTS", "").strip()
+    if raw_weights:
+        parts = [p.strip() for p in raw_weights.split(",") if p.strip()]
+        if len(parts) != key_count:
+            return (
+                [],
+                f"EMBEDDING_PROXY_KEY_WEIGHTS must contain exactly {key_count} positive integers",
+            )
+
+        weights: list[int] = []
+        for idx, part in enumerate(parts, start=1):
+            try:
+                value = int(part)
+            except ValueError:
+                return (
+                    [],
+                    f"EMBEDDING_PROXY_KEY_WEIGHTS contains non-integer value at position {idx}",
+                )
+
+            if value < 1:
+                return (
+                    [],
+                    f"EMBEDDING_PROXY_KEY_WEIGHTS values must be >= 1 (position {idx})",
+                )
+            weights.append(value)
+
+        return weights, None
+
+    raw_primary_weight = cfg.get("EMBEDDING_PROXY_PRIMARY_WEIGHT", "1").strip()
+    try:
+        primary_weight = int(raw_primary_weight)
+    except ValueError:
+        return [], "EMBEDDING_PROXY_PRIMARY_WEIGHT must be an integer >= 1"
+
+    if primary_weight < 1:
+        return [], "EMBEDDING_PROXY_PRIMARY_WEIGHT must be >= 1"
+
+    return [primary_weight] + [1] * (key_count - 1), None
+
+
 def get_server_executable(root: Path) -> Path:
     if os.name == "nt":
         return root / ".venv" / "Scripts" / "lightrag-server.exe"
@@ -275,7 +384,7 @@ def main() -> int:
 
     if not embedding_keys:
         print(
-            "No valid embedding key found. Set EMBEDDING_BINDING_API_KEY_1..3 (or EMBEDDING_BINDING_API_KEYS) in .env."
+            "No valid embedding key found. Set EMBEDDING_BINDING_API_KEY_1..4 (or EMBEDDING_BINDING_API_KEYS) in .env."
         )
         return 1
 
@@ -288,7 +397,7 @@ def main() -> int:
 
     if not validated_keys:
         print(
-            "No valid embedding key passed preflight. Check EMBEDDING_BINDING_API_KEY_1..3 (or EMBEDDING_BINDING_API_KEYS) in .env."
+            "No valid embedding key passed preflight. Check EMBEDDING_BINDING_API_KEY_1..4 (or EMBEDDING_BINDING_API_KEYS) in .env."
         )
         return 1
 
@@ -297,7 +406,7 @@ def main() -> int:
             f"Only {len(validated_keys)} embedding key(s) passed preflight; require at least {required_valid_keys}."
         )
         print(
-            "Update EMBEDDING_BINDING_API_KEY_1..3 (or EMBEDDING_BINDING_API_KEYS) in .env."
+            "Update EMBEDDING_BINDING_API_KEY_1..4 (or EMBEDDING_BINDING_API_KEYS) in .env."
         )
         return 1
 
@@ -307,11 +416,32 @@ def main() -> int:
             print(proxy_port_error)
             return 1
 
+        proxy_wait_seconds, proxy_wait_seconds_error = parse_embedding_proxy_wait_seconds(merged)
+        if proxy_wait_seconds_error:
+            print(proxy_wait_seconds_error)
+            return 1
+
+        proxy_max_429_retries, proxy_max_429_retries_error = parse_embedding_proxy_max_429_retries(merged)
+        if proxy_max_429_retries_error:
+            print(proxy_max_429_retries_error)
+            return 1
+
+        key_weights, key_weights_error = parse_embedding_proxy_key_weights(
+            merged,
+            len(validated_keys),
+        )
+        if key_weights_error:
+            print(key_weights_error)
+            return 1
+
         try:
             proxy_server = start_embedding_round_robin_proxy(
                 upstream_host=emb_host,
                 api_keys=validated_keys,
+                key_weights=key_weights,
                 port=proxy_port,
+                retry_wait_seconds=proxy_wait_seconds,
+                max_retries_on_429=proxy_max_429_retries,
             )
         except OSError as exc:
             print(f"Failed to start embedding round-robin proxy on 127.0.0.1:{proxy_port}: {exc}")
@@ -319,7 +449,10 @@ def main() -> int:
 
         os.environ["EMBEDDING_BINDING_HOST"] = f"http://127.0.0.1:{proxy_port}/v1"
         os.environ["EMBEDDING_BINDING_API_KEY"] = "ROUND_ROBIN_PROXY"
-        print(f"Embedding round-robin enabled across {len(validated_keys)} keys via local proxy on 127.0.0.1:{proxy_port}")
+        print(
+            f"Embedding round-robin enabled across {len(validated_keys)} keys via local proxy on 127.0.0.1:{proxy_port} "
+            f"(weights: {key_weights}, 429 backoff: {proxy_wait_seconds}s, retries: {proxy_max_429_retries})"
+        )
     else:
         selected_embedding_key = validated_keys[0]
         os.environ["EMBEDDING_BINDING_API_KEY"] = selected_embedding_key
@@ -328,6 +461,7 @@ def main() -> int:
         "EMBEDDING_BINDING_API_KEY_1",
         "EMBEDDING_BINDING_API_KEY_2",
         "EMBEDDING_BINDING_API_KEY_3",
+        "EMBEDDING_BINDING_API_KEY_4",
         "EMBEDDING_BINDING_API_KEY_MAIN",
         "EMBEDDING_BINDING_API_KEY_FALLBACK",
         "EMBEDDING_BINDING_API_KEYS",
