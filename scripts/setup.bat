@@ -39,6 +39,10 @@ if not exist "logs" mkdir "logs"
 
 echo.
 echo Setup finished.
-if not exist ".env.local" (
-  echo NOTE: .env.local is missing. Add your API keys before start-server.
+if not exist ".env" (
+  if exist ".env.example" (
+    echo NOTE: .env is missing. Copy .env.example to .env and add your API keys before start-server.bat.
+  ) else (
+    echo NOTE: .env is missing. Create .env and add your API keys before start-server.bat.
+  )
 )

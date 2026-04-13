@@ -12,35 +12,20 @@ if not exist ".env" (
   exit /b 1
 )
 
-if not exist ".env.local" (
-  echo .env.local not found.
-  echo Add local API keys in .env.local.
-  exit /b 1
-)
+if /I not "%LIGHTRAG_SKIP_KEYCHECK%"=="1" (
+  if not exist "scripts\check_api_keys.py" (
+    echo Required preflight script is missing: scripts\check_api_keys.py
+    echo Restore the file or set LIGHTRAG_SKIP_KEYCHECK=1 to bypass.
+    exit /b 1
+  )
 
-for /f "usebackq tokens=1,* delims==" %%A in (`findstr /R /V /C:"^[ ]*#" /C:"^[ ]*$" ".env.local"`) do (
-  set "%%A=%%B"
-)
-
-if "%LLM_BINDING_API_KEY%"=="" (
-  echo LLM_BINDING_API_KEY is missing in .env.local.
-  exit /b 1
-)
-
-if /I "%LLM_BINDING_API_KEY%"=="REVOKE_AND_REPLACE" (
-  echo LLM_BINDING_API_KEY is still a placeholder. Update .env.local first.
-  exit /b 1
-)
-
-if "%EMBEDDING_BINDING_API_KEY%"=="" (
-  echo EMBEDDING_BINDING_API_KEY is missing in .env.local.
-  exit /b 1
-)
-
-if /I "%EMBEDDING_BINDING_API_KEY%"=="REVOKE_AND_REPLACE" (
-  echo EMBEDDING_BINDING_API_KEY is still a placeholder. Update .env.local first.
-  exit /b 1
+  echo Running provider key preflight...
+  ".venv\Scripts\python.exe" "scripts\check_api_keys.py" --timeout 20
+  if errorlevel 1 (
+    echo Provider preflight failed. Update keys in .env or set LIGHTRAG_SKIP_KEYCHECK=1 to bypass.
+    exit /b 1
+  )
 )
 
 echo Starting LightRAG server at http://127.0.0.1:9621
-".venv\Scripts\lightrag-server.exe" %*
+".venv\Scripts\python.exe" "scripts\run_server.py" %*

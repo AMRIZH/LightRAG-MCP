@@ -14,15 +14,14 @@ Then create local environment files from templates:
 
 ```
 copy .env.example .env
-copy .env.local.example .env.local
 ```
 
 ## 2) Security steps (required)
 
 1. Rotate both previously exposed API keys in your provider dashboards.
-2. Replace `REVOKE_AND_REPLACE` values in `.env.local` with new keys.
-3. Keep `.env` as non-secret runtime config.
-4. Keep `.env.example` and `.env.local.example` as shareable templates.
+2. Replace `REVOKE_AND_REPLACE` values in `.env` with new keys.
+3. Treat `.env` as secret local runtime config (never commit/share it).
+4. Keep `.env.example` as shareable template.
 
 Project overview and quickstart are also available in `README.md`.
 
@@ -30,6 +29,20 @@ Project overview and quickstart are also available in `README.md`.
 
 ```
 scripts\start-server.bat
+```
+
+The startup script runs provider key preflight automatically and stops if keys are invalid.
+
+Run checker directly:
+
+```
+scripts\check-keys.bat
+```
+
+PowerShell bypass for offline/debug sessions:
+
+```
+$env:LIGHTRAG_SKIP_KEYCHECK='1'; scripts\start-server.bat
 ```
 
 Health check:
@@ -74,7 +87,7 @@ Prepare + upload to LightRAG API:
 
 Optional flags:
 - Allow missing metadata (not recommended): `--allow-missing-metadata`
-- Send auth header: `--api-key YOUR_LIGHTRAG_API_KEY`
+- Send auth header (avoid hardcoding literal keys in command history): `--api-key $env:LIGHTRAG_API_KEY`
 - Allow non-localhost upload targets: `--allow-remote` (requires HTTPS for remote)
 - File/page guardrails: `--max-pdf-size-bytes` and `--max-pages`
 
@@ -104,3 +117,17 @@ Skill source in this repository:
 
 `Qwen/Qwen3-Reranker-8B` is documented in `.env` but disabled by default (`RERANK_BINDING=null`) to ensure stable startup.
 Enable it only after confirming compatible endpoint behavior with LightRAG reranker bindings.
+
+## Troubleshooting 401
+
+If logs show `openai.AuthenticationError: Error code: 401 - Api key is invalid` during embedding:
+- Update `EMBEDDING_BINDING_API_KEY_MAIN` and `EMBEDDING_BINDING_API_KEY_FALLBACK` in `.env` with valid Voyage API keys.
+- `EMBEDDING_BINDING_API_KEY_FALLBACK` is optional and used only if main fails.
+- Re-run `scripts\check-keys.bat` until embedding check passes.
+- Restart with `scripts\start-server.bat`.
+
+Voyage model choice:
+- Default in this project is `voyage-4-large`.
+
+After changing embedding model:
+- Clear old vector data in `data/rag_storage` and re-ingest documents to avoid mixed embeddings.
