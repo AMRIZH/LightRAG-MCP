@@ -16,15 +16,32 @@ PLACEHOLDERS = {
 }
 
 
-def resolve_embedding_keys(cfg: Dict[str, str]) -> Tuple[str, str]:
-    main = cfg.get("EMBEDDING_BINDING_API_KEY_MAIN", "").strip()
-    fallback = cfg.get("EMBEDDING_BINDING_API_KEY_FALLBACK", "").strip()
-    legacy = cfg.get("EMBEDDING_BINDING_API_KEY", "").strip()
+def collect_embedding_keys(cfg: Dict[str, str]) -> list[str]:
+    keys: list[str] = []
+    seen: set[str] = set()
 
-    if not main and legacy:
-        main = legacy
+    csv_keys = cfg.get("EMBEDDING_BINDING_API_KEYS", "").strip()
+    if csv_keys:
+        for item in csv_keys.split(","):
+            key = item.strip()
+            if key and not is_placeholder(key) and key not in seen:
+                keys.append(key)
+                seen.add(key)
 
-    return main, fallback
+    for env_name in (
+        "EMBEDDING_BINDING_API_KEY_1",
+        "EMBEDDING_BINDING_API_KEY_2",
+        "EMBEDDING_BINDING_API_KEY_3",
+        "EMBEDDING_BINDING_API_KEY_MAIN",
+        "EMBEDDING_BINDING_API_KEY_FALLBACK",
+        "EMBEDDING_BINDING_API_KEY",
+    ):
+        key = cfg.get(env_name, "").strip()
+        if key and not is_placeholder(key) and key not in seen:
+            keys.append(key)
+            seen.add(key)
+
+    return keys
 
 
 def load_env_file(path: Path) -> Dict[str, str]:
@@ -53,6 +70,22 @@ def build_url(base: str, path: str) -> str:
 
 def is_placeholder(value: str) -> bool:
     return value.strip() in PLACEHOLDERS
+
+
+def parse_required_embedding_keys(cfg: Dict[str, str]) -> Tuple[int, str | None]:
+    raw = cfg.get("EMBEDDING_REQUIRED_VALID_KEYS", "2").strip()
+    if not raw:
+        return 2, None
+
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0, "EMBEDDING_REQUIRED_VALID_KEYS must be an integer >= 1"
+
+    if value < 1:
+        return 0, "EMBEDDING_REQUIRED_VALID_KEYS must be >= 1"
+
+    return value, None
 
 
 def test_embedding_with_key(
@@ -92,40 +125,73 @@ def test_embedding_with_key(
 def test_embedding(cfg: Dict[str, str], timeout: int) -> Tuple[bool, str]:
     host = cfg.get("EMBEDDING_BINDING_HOST", "").strip()
     model = cfg.get("EMBEDDING_MODEL", "").strip()
-    main_key, fallback_key = resolve_embedding_keys(cfg)
+    keys = collect_embedding_keys(cfg)
+    required_valid_keys, required_error = parse_required_embedding_keys(cfg)
 
     if not host or not model:
         return False, "Missing embedding host/model"
 
-    if not main_key and not fallback_key:
-        return False, "Missing embedding key(s). Set EMBEDDING_BINDING_API_KEY_MAIN and optionally EMBEDDING_BINDING_API_KEY_FALLBACK"
+    if required_error:
+        return False, required_error
 
-    main_ok, main_msg = test_embedding_with_key(host, model, main_key, timeout)
-    if main_ok:
-        return True, "ok (using main key)"
+    if not keys:
+        return (
+            False,
+            "Missing embedding key(s). Set one of: EMBEDDING_BINDING_API_KEY_1..3, "
+            "EMBEDDING_BINDING_API_KEYS, EMBEDDING_BINDING_API_KEY_MAIN, "
+            "EMBEDDING_BINDING_API_KEY_FALLBACK, or EMBEDDING_BINDING_API_KEY.",
+        )
 
-    if fallback_key and not is_placeholder(fallback_key):
-        fb_ok, fb_msg = test_embedding_with_key(host, model, fallback_key, timeout)
-        if fb_ok:
-            return True, "ok (using fallback key)"
-        return False, f"main failed ({main_msg}); fallback failed ({fb_msg})"
+    valid_keys = 0
+    failures: list[str] = []
 
-    if is_placeholder(main_key):
-        return False, "Embedding main key is placeholder. Replace EMBEDDING_BINDING_API_KEY_MAIN in .env"
+    for idx, key in enumerate(keys, start=1):
+        ok, msg = test_embedding_with_key(host, model, key, timeout)
+        if ok:
+            valid_keys += 1
+        else:
+            failures.append(f"key{idx}: {msg}")
 
-    return False, f"main failed ({main_msg}); fallback not configured"
+    if valid_keys == 0:
+        return False, "All embedding keys failed: " + "; ".join(failures)
+
+    if valid_keys < required_valid_keys:
+        detail = "; ".join(failures) if failures else "no failure details"
+        return (
+            False,
+            f"Only {valid_keys} embedding key(s) passed preflight; require at least {required_valid_keys}. {detail}",
+        )
+
+    if valid_keys == 1:
+        return True, "ok (1 embedding key passed preflight)"
+
+    return True, f"ok ({valid_keys} embedding keys passed preflight; round-robin ready)"
 
 
 def test_llm(cfg: Dict[str, str], timeout: int) -> Tuple[bool, str]:
     host = cfg.get("LLM_BINDING_HOST", "").strip()
     model = cfg.get("LLM_MODEL", "").strip()
     key = cfg.get("LLM_BINDING_API_KEY", "").strip()
+    max_tokens_raw = cfg.get("OPENAI_LLM_MAX_TOKENS", "").strip()
 
     if not host or not model or not key:
         return False, "Missing llm host/model/api key"
 
     if is_placeholder(key):
         return False, "LLM key is placeholder. Replace LLM_BINDING_API_KEY in .env"
+
+    if max_tokens_raw:
+        try:
+            max_tokens = int(max_tokens_raw)
+        except ValueError:
+            return False, "OPENAI_LLM_MAX_TOKENS must be an integer"
+
+        # DeepSeek's OpenAI-compatible endpoint currently allows [1, 8192].
+        if "deepseek.com" in host.lower() and not (1 <= max_tokens <= 8192):
+            return (
+                False,
+                "OPENAI_LLM_MAX_TOKENS out of range for DeepSeek; use a value in [1, 8192]",
+            )
 
     url = build_url(host, "/chat/completions")
     headers = {
