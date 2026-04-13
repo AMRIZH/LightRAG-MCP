@@ -114,12 +114,32 @@ def start_embedding_round_robin_proxy(
         def log_message(self, format: str, *args) -> None:  # noqa: A003
             return
 
+        def _safe_write_response(
+            self,
+            *,
+            status_code: int,
+            body: bytes,
+            content_type: str,
+        ) -> bool:
+            try:
+                self.send_response(status_code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return True
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
+                # Client disconnected while proxy was processing the request.
+                return False
+
         def do_POST(self) -> None:  # noqa: N802
             request_path = urlsplit(self.path).path.rstrip("/")
             if request_path not in ("/embeddings", "/v1/embeddings"):
-                self.send_response(404)
-                self.end_headers()
-                self.wfile.write(b'{"error":"not_found"}')
+                self._safe_write_response(
+                    status_code=404,
+                    body=b'{"error":"not_found"}',
+                    content_type="application/json",
+                )
                 return
 
             content_length = int(self.headers.get("Content-Length", "0"))
@@ -159,11 +179,11 @@ def start_embedding_round_robin_proxy(
                             "message": str(exc),
                         }
                     ).encode("utf-8")
-                    self.send_response(502)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(payload)))
-                    self.end_headers()
-                    self.wfile.write(payload)
+                    self._safe_write_response(
+                        status_code=502,
+                        body=payload,
+                        content_type="application/json",
+                    )
                     return
 
                 if upstream_resp.status_code != 429 or attempt == total_attempts - 1:
@@ -181,22 +201,19 @@ def start_embedding_round_robin_proxy(
 
             if upstream_resp is None:
                 payload = b'{"error":"proxy_request_failed","message":"no upstream response"}'
-                self.send_response(502)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
+                self._safe_write_response(
+                    status_code=502,
+                    body=payload,
+                    content_type="application/json",
+                )
                 return
 
             response_body = upstream_resp.content
-            self.send_response(upstream_resp.status_code)
-            self.send_header(
-                "Content-Type",
-                upstream_resp.headers.get("Content-Type", "application/json"),
+            self._safe_write_response(
+                status_code=upstream_resp.status_code,
+                body=response_body,
+                content_type=upstream_resp.headers.get("Content-Type", "application/json"),
             )
-            self.send_header("Content-Length", str(len(response_body)))
-            self.end_headers()
-            self.wfile.write(response_body)
 
     server = ThreadingHTTPServer(("127.0.0.1", port), EmbeddingProxyHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
